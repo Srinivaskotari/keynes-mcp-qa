@@ -1,7 +1,10 @@
 from fastapi import FastAPI
 import boto3
 import time
-from datetime import date, timedelta
+import os
+import json
+
+from datetime import datetime, date, timedelta
 from botocore.exceptions import ClientError
 
 from datasets import DATASETS
@@ -22,25 +25,223 @@ DATABASE = "domo_reports_s3"
 
 OUTPUT_BUCKET = "s3://keynes-athena-results-srinivas"
 
+MAX_QUERY_LENGTH = 5000
+
+LOG_DIR = "logs"
+
+LOG_FILE = f"{LOG_DIR}/query_history.log"
+
+ALLOWED_TABLES = [
+
+    "client_reporting_date_dataset",
+
+    "client_reporting_geo_dataset",
+
+    "client_reporting_network_dataset_myreports",
+
+    "client_reporting_hour_dataset"
+
+]
+
+BLOCKED_KEYWORDS = [
+
+    "DROP",
+    "DELETE",
+    "TRUNCATE",
+    "ALTER",
+    "INSERT",
+    "UPDATE",
+    "CREATE"
+
+]
+
+# =========================================================
+# CREATE LOG DIRECTORY
+# =========================================================
+
+os.makedirs(LOG_DIR, exist_ok=True)
+
 # =========================================================
 # ATHENA CLIENT
 # =========================================================
 
 athena = boto3.client(
+
     "athena",
+
     region_name=REGION
+
 )
 
 # =========================================================
-# ATHENA QUERY EXECUTOR
+# QUERY LOGGER
+# =========================================================
+
+def log_query(entry: dict):
+
+    with open(LOG_FILE, "a") as f:
+
+        f.write(
+            json.dumps(entry) + "\n"
+        )
+
+# =========================================================
+# SQL VALIDATION
+# =========================================================
+
+def validate_sql(sql: str):
+
+    sql_upper = sql.upper()
+
+    # =====================================================
+    # QUERY LENGTH CHECK
+    # =====================================================
+
+    if len(sql) > MAX_QUERY_LENGTH:
+
+        return {
+
+            "valid": False,
+
+            "error":
+            "Query exceeds maximum allowed length"
+
+        }
+
+    # =====================================================
+    # ALLOWED QUERY TYPES
+    # =====================================================
+
+    allowed_starts = [
+
+        "SELECT",
+        "SHOW",
+        "WITH"
+
+    ]
+
+    if not any(
+        sql_upper.strip().startswith(x)
+        for x in allowed_starts
+    ):
+
+        return {
+
+            "valid": False,
+
+            "error":
+            "Only SELECT/SHOW/WITH queries allowed"
+
+        }
+
+    # =====================================================
+    # BLOCK DANGEROUS KEYWORDS
+    # =====================================================
+
+    for keyword in BLOCKED_KEYWORDS:
+
+        if keyword in sql_upper:
+
+            return {
+
+                "valid": False,
+
+                "error":
+                f"Blocked keyword detected: {keyword}"
+
+            }
+
+    # =====================================================
+    # ALLOWED TABLES
+    # =====================================================
+
+    found_allowed_table = False
+
+    for table in ALLOWED_TABLES:
+
+        if table.lower() in sql.lower():
+
+            found_allowed_table = True
+            break
+
+    if sql_upper.startswith("SHOW COLUMNS"):
+        found_allowed_table = True
+
+    if not found_allowed_table:
+
+        return {
+
+            "valid": False,
+
+            "error":
+            "Unauthorized table access"
+
+        }
+
+    # =====================================================
+    # AUTO LIMIT
+    # =====================================================
+
+    if (
+        "LIMIT" not in sql_upper
+        and sql_upper.startswith("SELECT")
+    ):
+
+        sql += "\nLIMIT 100"
+
+    return {
+
+        "valid": True,
+
+        "sql": sql
+
+    }
+
+# =========================================================
+# ATHENA QUERY EXECUTION
 # =========================================================
 
 def run_athena_query(query: str):
+
+    start_time = time.time()
 
     print("\n================================================")
     print("EXECUTING ATHENA QUERY")
     print("================================================")
     print(query)
+
+    validation = validate_sql(query)
+
+    if not validation["valid"]:
+
+        log_query({
+
+            "timestamp":
+            str(datetime.utcnow()),
+
+            "success":
+            False,
+
+            "query":
+            query,
+
+            "error":
+            validation["error"]
+
+        })
+
+        return {
+
+            "success": False,
+
+            "error":
+            validation["error"],
+
+            "results": []
+
+        }
+
+    query = validation["sql"]
 
     try:
 
@@ -58,14 +259,16 @@ def run_athena_query(query: str):
 
         )
 
-        query_execution_id = response["QueryExecutionId"]
-
-        print(f"\nQueryExecutionId: {query_execution_id}")
+        query_execution_id = response[
+            "QueryExecutionId"
+        ]
 
         while True:
 
             status = athena.get_query_execution(
+
                 QueryExecutionId=query_execution_id
+
             )
 
             state = status[
@@ -82,16 +285,38 @@ def run_athena_query(query: str):
                 reason = status[
                     "QueryExecution"
                 ]["Status"].get(
+
                     "StateChangeReason",
+
                     "Unknown Athena Error"
+
                 )
 
-                print(f"\nATHENA QUERY FAILED:\n{reason}")
+                log_query({
+
+                    "timestamp":
+                    str(datetime.utcnow()),
+
+                    "success":
+                    False,
+
+                    "query":
+                    query,
+
+                    "query_execution_id":
+                    query_execution_id,
+
+                    "error":
+                    reason
+
+                })
 
                 return {
 
                     "success": False,
+
                     "error": reason,
+
                     "results": []
 
                 }
@@ -99,43 +324,71 @@ def run_athena_query(query: str):
             time.sleep(2)
 
         results = athena.get_query_results(
+
             QueryExecutionId=query_execution_id
+
         )
 
         rows = results["ResultSet"]["Rows"]
 
         if len(rows) <= 1:
 
-            return {
+            parsed_rows = []
 
-                "success": True,
-                "results": []
+        else:
 
-            }
-
-        headers = [
-
-            col.get("VarCharValue", "")
-            for col in rows[0]["Data"]
-
-        ]
-
-        parsed_rows = []
-
-        for row in rows[1:]:
-
-            values = [
+            headers = [
 
                 col.get("VarCharValue", "")
-                for col in row["Data"]
+                for col in rows[0]["Data"]
 
             ]
 
-            parsed_rows.append(
-                dict(zip(headers, values))
-            )
+            parsed_rows = []
 
-        print(f"\nReturned {len(parsed_rows)} rows")
+            for row in rows[1:]:
+
+                values = [
+
+                    col.get("VarCharValue", "")
+                    for col in row["Data"]
+
+                ]
+
+                parsed_rows.append(
+
+                    dict(zip(headers, values))
+
+                )
+
+        execution_time = round(
+
+            time.time() - start_time,
+            2
+
+        )
+
+        log_query({
+
+            "timestamp":
+            str(datetime.utcnow()),
+
+            "success":
+            True,
+
+            "query":
+            query,
+
+            "query_execution_id":
+            query_execution_id,
+
+            "row_count":
+            len(parsed_rows),
+
+            "execution_time_seconds":
+            execution_time
+
+        })
 
         return {
 
@@ -147,6 +400,9 @@ def run_athena_query(query: str):
             "row_count":
             len(parsed_rows),
 
+            "execution_time_seconds":
+            execution_time,
+
             "results":
             parsed_rows
 
@@ -154,24 +410,62 @@ def run_athena_query(query: str):
 
     except ClientError as e:
 
-        print(f"\nAWS CLIENT ERROR:\n{str(e)}")
+        error_message = str(e)
+
+        log_query({
+
+            "timestamp":
+            str(datetime.utcnow()),
+
+            "success":
+            False,
+
+            "query":
+            query,
+
+            "error":
+            error_message
+
+        })
 
         return {
 
             "success": False,
-            "error": str(e),
+
+            "error":
+            error_message,
+
             "results": []
 
         }
 
     except Exception as e:
 
-        print(f"\nUNEXPECTED ERROR:\n{str(e)}")
+        error_message = str(e)
+
+        log_query({
+
+            "timestamp":
+            str(datetime.utcnow()),
+
+            "success":
+            False,
+
+            "query":
+            query,
+
+            "error":
+            error_message
+
+        })
 
         return {
 
             "success": False,
-            "error": str(e),
+
+            "error":
+            error_message,
+
             "results": []
 
         }
@@ -194,7 +488,7 @@ def home():
     }
 
 # =========================================================
-# HEALTH CHECK
+# HEALTH
 # =========================================================
 
 @app.get("/health")
@@ -225,7 +519,7 @@ def get_datasets():
     }
 
 # =========================================================
-# TABLE SCHEMA DISCOVERY
+# SCHEMA DISCOVERY
 # =========================================================
 
 @app.get("/schema/{table_name}")
@@ -307,7 +601,7 @@ def current_date():
     }
 
 # =========================================================
-# ATHENA QUERY API
+# QUERY API
 # =========================================================
 
 @app.post("/query")
@@ -320,7 +614,9 @@ def query(payload: dict):
         return {
 
             "success": False,
-            "error": "No SQL provided"
+
+            "error":
+            "No SQL provided"
 
         }
 
