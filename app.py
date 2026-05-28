@@ -3,9 +3,11 @@ import boto3
 import time
 import os
 import json
+import uuid
+import threading
+import redis
 
-from datetime import datetime, date, timedelta
-from botocore.exceptions import ClientError
+from datetime import datetime
 
 from datasets import DATASETS
 
@@ -16,7 +18,7 @@ from datasets import DATASETS
 app = FastAPI()
 
 # =========================================================
-# CONFIGURATION
+# CONFIG
 # =========================================================
 
 REGION = "us-east-1"
@@ -27,9 +29,29 @@ OUTPUT_BUCKET = "s3://keynes-athena-results-srinivas"
 
 MAX_QUERY_LENGTH = 5000
 
+CACHE_TTL_SECONDS = 300
+
 LOG_DIR = "logs"
 
 LOG_FILE = f"{LOG_DIR}/query_history.log"
+
+# =========================================================
+# REDIS CLIENT
+# =========================================================
+
+redis_client = redis.Redis(
+
+    host="localhost",
+
+    port=6379,
+
+    decode_responses=True
+
+)
+
+# =========================================================
+# SECURITY
+# =========================================================
 
 ALLOWED_TABLES = [
 
@@ -56,7 +78,7 @@ BLOCKED_KEYWORDS = [
 ]
 
 # =========================================================
-# CREATE LOG DIRECTORY
+# LOG DIRECTORY
 # =========================================================
 
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -74,16 +96,14 @@ athena = boto3.client(
 )
 
 # =========================================================
-# QUERY LOGGER
+# LOGGER
 # =========================================================
 
 def log_query(entry: dict):
 
     with open(LOG_FILE, "a") as f:
 
-        f.write(
-            json.dumps(entry) + "\n"
-        )
+        f.write(json.dumps(entry) + "\n")
 
 # =========================================================
 # SQL VALIDATION
@@ -92,10 +112,6 @@ def log_query(entry: dict):
 def validate_sql(sql: str):
 
     sql_upper = sql.upper()
-
-    # =====================================================
-    # QUERY LENGTH CHECK
-    # =====================================================
 
     if len(sql) > MAX_QUERY_LENGTH:
 
@@ -107,10 +123,6 @@ def validate_sql(sql: str):
             "Query exceeds maximum allowed length"
 
         }
-
-    # =====================================================
-    # ALLOWED QUERY TYPES
-    # =====================================================
 
     allowed_starts = [
 
@@ -134,10 +146,6 @@ def validate_sql(sql: str):
 
         }
 
-    # =====================================================
-    # BLOCK DANGEROUS KEYWORDS
-    # =====================================================
-
     for keyword in BLOCKED_KEYWORDS:
 
         if keyword in sql_upper:
@@ -150,10 +158,6 @@ def validate_sql(sql: str):
                 f"Blocked keyword detected: {keyword}"
 
             }
-
-    # =====================================================
-    # ALLOWED TABLES
-    # =====================================================
 
     found_allowed_table = False
 
@@ -178,10 +182,6 @@ def validate_sql(sql: str):
 
         }
 
-    # =====================================================
-    # AUTO LIMIT
-    # =====================================================
-
     if (
         "LIMIT" not in sql_upper
         and sql_upper.startswith("SELECT")
@@ -198,50 +198,24 @@ def validate_sql(sql: str):
     }
 
 # =========================================================
-# ATHENA QUERY EXECUTION
+# REDIS HELPERS
 # =========================================================
 
-def run_athena_query(query: str):
+def get_cache_key(query):
+
+    return f"cache:{query}"
+
+def get_query_key(query_id):
+
+    return f"query:{query_id}"
+
+# =========================================================
+# BACKGROUND QUERY EXECUTION
+# =========================================================
+
+def execute_query_background(query_id, query):
 
     start_time = time.time()
-
-    print("\n================================================")
-    print("EXECUTING ATHENA QUERY")
-    print("================================================")
-    print(query)
-
-    validation = validate_sql(query)
-
-    if not validation["valid"]:
-
-        log_query({
-
-            "timestamp":
-            str(datetime.utcnow()),
-
-            "success":
-            False,
-
-            "query":
-            query,
-
-            "error":
-            validation["error"]
-
-        })
-
-        return {
-
-            "success": False,
-
-            "error":
-            validation["error"],
-
-            "results": []
-
-        }
-
-    query = validation["sql"]
 
     try:
 
@@ -259,15 +233,35 @@ def run_athena_query(query: str):
 
         )
 
-        query_execution_id = response[
+        athena_execution_id = response[
             "QueryExecutionId"
         ]
+
+        redis_client.set(
+
+            get_query_key(query_id),
+
+            json.dumps({
+
+                "query": query,
+
+                "status": "RUNNING",
+
+                "athena_execution_id":
+                athena_execution_id,
+
+                "start_time":
+                str(datetime.utcnow())
+
+            })
+
+        )
 
         while True:
 
             status = athena.get_query_execution(
 
-                QueryExecutionId=query_execution_id
+                QueryExecutionId=athena_execution_id
 
             )
 
@@ -275,57 +269,48 @@ def run_athena_query(query: str):
                 "QueryExecution"
             ]["Status"]["State"]
 
-            print(f"Athena State: {state}")
+            current_data = json.loads(
+
+                redis_client.get(
+
+                    get_query_key(query_id)
+
+                )
+
+            )
+
+            current_data["status"] = state
+
+            redis_client.set(
+
+                get_query_key(query_id),
+
+                json.dumps(current_data)
+
+            )
 
             if state == "SUCCEEDED":
                 break
 
             if state in ["FAILED", "CANCELLED"]:
 
-                reason = status[
-                    "QueryExecution"
-                ]["Status"].get(
+                current_data["status"] = state
 
-                    "StateChangeReason",
+                redis_client.set(
 
-                    "Unknown Athena Error"
+                    get_query_key(query_id),
+
+                    json.dumps(current_data)
 
                 )
 
-                log_query({
-
-                    "timestamp":
-                    str(datetime.utcnow()),
-
-                    "success":
-                    False,
-
-                    "query":
-                    query,
-
-                    "query_execution_id":
-                    query_execution_id,
-
-                    "error":
-                    reason
-
-                })
-
-                return {
-
-                    "success": False,
-
-                    "error": reason,
-
-                    "results": []
-
-                }
+                return
 
             time.sleep(2)
 
         results = athena.get_query_results(
 
-            QueryExecutionId=query_execution_id
+            QueryExecutionId=athena_execution_id
 
         )
 
@@ -368,107 +353,82 @@ def run_athena_query(query: str):
 
         )
 
+        current_data = json.loads(
+
+            redis_client.get(
+
+                get_query_key(query_id)
+
+            )
+
+        )
+
+        current_data["status"] = "COMPLETED"
+
+        current_data[
+            "execution_time_seconds"
+        ] = execution_time
+
+        redis_client.set(
+
+            get_query_key(query_id),
+
+            json.dumps(current_data)
+
+        )
+
+        redis_client.setex(
+
+            get_cache_key(query),
+
+            CACHE_TTL_SECONDS,
+
+            json.dumps(parsed_rows)
+
+        )
+
+        redis_client.set(
+
+            f"result:{query_id}",
+
+            json.dumps(parsed_rows)
+
+        )
+
         log_query({
 
             "timestamp":
             str(datetime.utcnow()),
 
-            "success":
-            True,
+            "query_id":
+            query_id,
 
             "query":
             query,
-
-            "query_execution_id":
-            query_execution_id,
-
-            "row_count":
-            len(parsed_rows),
-
-            "execution_time_seconds":
-            execution_time
-
-        })
-
-        return {
-
-            "success": True,
-
-            "query_execution_id":
-            query_execution_id,
-
-            "row_count":
-            len(parsed_rows),
 
             "execution_time_seconds":
             execution_time,
 
-            "results":
-            parsed_rows
-
-        }
-
-    except ClientError as e:
-
-        error_message = str(e)
-
-        log_query({
-
-            "timestamp":
-            str(datetime.utcnow()),
-
-            "success":
-            False,
-
-            "query":
-            query,
-
-            "error":
-            error_message
+            "row_count":
+            len(parsed_rows)
 
         })
-
-        return {
-
-            "success": False,
-
-            "error":
-            error_message,
-
-            "results": []
-
-        }
 
     except Exception as e:
 
-        error_message = str(e)
+        redis_client.set(
 
-        log_query({
+            get_query_key(query_id),
 
-            "timestamp":
-            str(datetime.utcnow()),
+            json.dumps({
 
-            "success":
-            False,
+                "status": "FAILED",
 
-            "query":
-            query,
+                "error": str(e)
 
-            "error":
-            error_message
+            })
 
-        })
-
-        return {
-
-            "success": False,
-
-            "error":
-            error_message,
-
-            "results": []
-
-        }
+        )
 
 # =========================================================
 # HOME
@@ -480,10 +440,7 @@ def home():
     return {
 
         "message":
-        "Keynes QA Analytics API Running",
-
-        "environment":
-        "QA"
+        "Keynes QA Analytics API Running"
 
     }
 
@@ -497,10 +454,7 @@ def health():
     return {
 
         "status":
-        "healthy",
-
-        "environment":
-        "qa"
+        "healthy"
 
     }
 
@@ -519,93 +473,340 @@ def get_datasets():
     }
 
 # =========================================================
-# SCHEMA DISCOVERY
+# ACTIVE QUERIES
 # =========================================================
 
-@app.get("/schema/{table_name}")
-def get_table_schema(table_name: str):
+@app.get("/active-queries")
+def active_queries():
 
-    query = f"SHOW COLUMNS IN {table_name}"
+    keys = redis_client.keys("query:*")
 
-    return run_athena_query(query)
+    queries = {}
 
-# =========================================================
-# CURRENT DATE
-# =========================================================
+    for key in keys:
 
-@app.get("/current-date")
-def current_date():
+        queries[key] = json.loads(
 
-    today = date.today()
+            redis_client.get(key)
 
-    this_week_start = (
-        today - timedelta(days=today.weekday())
-    )
-
-    last_week_start = (
-        this_week_start - timedelta(days=7)
-    )
-
-    last_week_end = (
-        this_week_start - timedelta(days=1)
-    )
-
-    this_month_start = today.replace(day=1)
-
-    last_month_end = (
-        this_month_start - timedelta(days=1)
-    )
-
-    last_month_start = (
-        last_month_end.replace(day=1)
-    )
-
-    last_month_same_end = (
-        last_month_start + timedelta(
-            days=(today.day - 1)
         )
-    )
+
+    return queries
+
+# =========================================================
+# QUERY HISTORY
+# =========================================================
+
+@app.get("/query-history")
+def query_history():
+
+    try:
+
+        with open(LOG_FILE, "r") as f:
+
+            lines = f.readlines()
+
+        return {
+
+            "queries":
+            [json.loads(x) for x in lines[-20:]]
+
+        }
+
+    except:
+
+        return {
+
+            "queries": []
+
+        }
+
+# =========================================================
+# CACHE STATS
+# =========================================================
+
+@app.get("/cache-stats")
+def cache_stats():
+
+    cache_keys = redis_client.keys("cache:*")
+
+    result_keys = redis_client.keys("result:*")
+
+    query_keys = redis_client.keys("query:*")
 
     return {
 
-        "today": str(today),
+        "cache_entries":
+        len(cache_keys),
 
-        "this_week": {
+        "stored_results":
+        len(result_keys),
 
-            "start": str(this_week_start),
-            "end": str(today)
-
-        },
-
-        "last_week": {
-
-            "start": str(last_week_start),
-            "end": str(last_week_end)
-
-        },
-
-        "this_month": {
-
-            "start": str(this_month_start),
-            "end": str(today)
-
-        },
-
-        "last_month_mtd": {
-
-            "start": str(last_month_start),
-            "end": str(last_month_same_end)
-
-        }
+        "tracked_queries":
+        len(query_keys)
 
     }
 
 # =========================================================
-# QUERY API
+# SYSTEM HEALTH
 # =========================================================
 
-@app.post("/query")
-def query(payload: dict):
+@app.get("/system-health")
+def system_health():
+
+    redis_status = "healthy"
+
+    try:
+
+        redis_client.ping()
+
+    except:
+
+        redis_status = "unhealthy"
+
+    return {
+
+        "api": "healthy",
+
+        "redis": redis_status,
+
+        "athena_region": REGION,
+
+        "database": DATABASE
+
+    }
+
+# =========================================================
+# QUERY SUMMARY
+# =========================================================
+
+@app.get("/query-summary")
+def query_summary():
+
+    try:
+
+        with open(LOG_FILE, "r") as f:
+
+            lines = f.readlines()
+
+        total_queries = len(lines)
+
+        total_execution_time = 0
+
+        successful_queries = 0
+
+        for line in lines:
+
+            try:
+
+                entry = json.loads(line)
+
+                execution_time = entry.get(
+
+                    "execution_time_seconds",
+
+                    0
+
+                )
+
+                total_execution_time += execution_time
+
+                successful_queries += 1
+
+            except:
+
+                pass
+
+        average_latency = 0
+
+        if successful_queries > 0:
+
+            average_latency = round(
+
+                total_execution_time /
+                successful_queries,
+
+                2
+
+            )
+
+        return {
+
+            "total_queries":
+            total_queries,
+
+            "successful_queries":
+            successful_queries,
+
+            "average_latency_seconds":
+            average_latency
+
+        }
+
+    except Exception as e:
+
+        return {
+
+            "error": str(e)
+
+        }
+
+# =========================================================
+# SLOW QUERIES
+# =========================================================
+
+@app.get("/slow-queries")
+def slow_queries():
+
+    slow = []
+
+    try:
+
+        with open(LOG_FILE, "r") as f:
+
+            lines = f.readlines()
+
+        for line in lines:
+
+            try:
+
+                entry = json.loads(line)
+
+                execution_time = entry.get(
+
+                    "execution_time_seconds",
+
+                    0
+
+                )
+
+                if execution_time >= 5:
+
+                    slow.append(entry)
+
+            except:
+
+                pass
+
+        slow = sorted(
+
+            slow,
+
+            key=lambda x:
+            x.get(
+                "execution_time_seconds",
+                0
+            ),
+
+            reverse=True
+
+        )
+
+        return {
+
+            "slow_queries":
+            slow[:20]
+
+        }
+
+    except Exception as e:
+
+        return {
+
+            "error": str(e)
+
+        }
+
+# =========================================================
+# METRICS
+# =========================================================
+
+@app.get("/metrics")
+def metrics():
+
+    try:
+
+        cache_keys = redis_client.keys("cache:*")
+
+        result_keys = redis_client.keys("result:*")
+
+        query_keys = redis_client.keys("query:*")
+
+        with open(LOG_FILE, "r") as f:
+
+            lines = f.readlines()
+
+        total_queries = len(lines)
+
+        total_execution_time = 0
+
+        for line in lines:
+
+            try:
+
+                entry = json.loads(line)
+
+                total_execution_time += entry.get(
+
+                    "execution_time_seconds",
+
+                    0
+
+                )
+
+            except:
+
+                pass
+
+        average_latency = 0
+
+        if total_queries > 0:
+
+            average_latency = round(
+
+                total_execution_time /
+                total_queries,
+
+                2
+
+            )
+
+        return {
+
+            "total_queries":
+            total_queries,
+
+            "average_latency_seconds":
+            average_latency,
+
+            "cache_entries":
+            len(cache_keys),
+
+            "stored_results":
+            len(result_keys),
+
+            "tracked_queries":
+            len(query_keys),
+
+            "redis_status":
+            "healthy"
+
+        }
+
+    except Exception as e:
+
+        return {
+
+            "error": str(e)
+
+        }
+
+# =========================================================
+# START QUERY
+# =========================================================
+
+@app.post("/query/start")
+def start_query(payload: dict):
 
     sql = payload.get("sql")
 
@@ -620,7 +821,144 @@ def query(payload: dict):
 
         }
 
-    return run_athena_query(sql)
+    validation = validate_sql(sql)
+
+    if not validation["valid"]:
+
+        return {
+
+            "success": False,
+
+            "error":
+            validation["error"]
+
+        }
+
+    sql = validation["sql"]
+
+    cache_key = get_cache_key(sql)
+
+    cached = redis_client.get(cache_key)
+
+    if cached:
+
+        return {
+
+            "success": True,
+
+            "cached": True,
+
+            "results":
+            json.loads(cached)
+
+        }
+
+    query_id = str(uuid.uuid4())
+
+    redis_client.set(
+
+        get_query_key(query_id),
+
+        json.dumps({
+
+            "query": sql,
+
+            "status": "STARTING",
+
+            "start_time":
+            str(datetime.utcnow())
+
+        })
+
+    )
+
+    thread = threading.Thread(
+
+        target=execute_query_background,
+
+        args=(query_id, sql)
+
+    )
+
+    thread.start()
+
+    return {
+
+        "success": True,
+
+        "query_id": query_id,
+
+        "status": "STARTED"
+
+    }
+
+# =========================================================
+# QUERY STATUS
+# =========================================================
+
+@app.get("/query/status/{query_id}")
+def query_status(query_id: str):
+
+    data = redis_client.get(
+
+        get_query_key(query_id)
+
+    )
+
+    if not data:
+
+        return {
+
+            "success": False,
+
+            "error":
+            "Query not found"
+
+        }
+
+    return json.loads(data)
+
+# =========================================================
+# QUERY RESULT
+# =========================================================
+
+@app.get("/query/result/{query_id}")
+def query_result(query_id: str):
+
+    result = redis_client.get(
+
+        f"result:{query_id}"
+
+    )
+
+    if not result:
+
+        return {
+
+            "success": False,
+
+            "message":
+            "Result not ready"
+
+        }
+
+    return {
+
+        "success": True,
+
+        "results":
+        json.loads(result)
+
+    }
+
+# =========================================================
+# LEGACY QUERY
+# =========================================================
+
+@app.post("/query")
+def query(payload: dict):
+
+    return start_query(payload)
 
 # =========================================================
 # MAIN
